@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import asyncio
 from aiogram import F
 import os
@@ -8,6 +8,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import WebAppInfo  # <-- для WebApp
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
@@ -124,7 +125,7 @@ async def set_bot_commands():
     except Exception as e:
         logger.error(f"❌ Ошибка установки команд: {e}")
 
-# Обработчик отмены FSM — ДОБАВЛЕНО!
+# Обработчик отмены FSM
 @dp.message(Command("cancel"))
 @dp.message(F.text.casefold() == "отмена")
 async def cancel_handler(message: types.Message, state: FSMContext):
@@ -261,6 +262,13 @@ async def show_admin_menu(message: types.Message):
     kb.button(text="🆕 Создать заказ", callback_data="admin_new_order")
     kb.button(text="📊 Отчёт по сменам", callback_data="admin_shift_report")
     kb.button(text="📋 Все заказы", callback_data="admin_all_orders")
+
+    # 🎨 КНОПКА WEBAPP — ОТКРЫВАЕТ ТВОЙ ИНТЕРФЕЙС
+    kb.button(
+        text="✨ Панель как в Figma",
+        web_app=WebAppInfo(url="https://ab646487-hash.github.io/telegram-bot-webapp/")
+    )
+
     kb.adjust(2)
     await message.answer("👑 Меню администратора:", reply_markup=kb.as_markup())
 
@@ -270,11 +278,11 @@ async def admin_new_order(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(OrderForm.address)
     await callback.answer()
 
-# Заглушки для админ-меню — ДОБАВЛЕНО!
+# Заглушки для админ-меню
 @dp.callback_query(lambda c: c.data == "admin_shift_report")
 async def admin_shift_report(callback: types.CallbackQuery):
     try:
-        records = shifts_sheet.get_all_records()[-10:]  # последние 10 смен
+        records = shifts_sheet.get_all_records()[-10:]
         if not records:
             await callback.message.edit_text("📭 Нет данных по сменам.")
         else:
@@ -291,7 +299,7 @@ async def admin_shift_report(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "admin_all_orders")
 async def admin_all_orders(callback: types.CallbackQuery):
     try:
-        records = sheet.get_all_records()[-10:]  # последние 10 заказов
+        records = sheet.get_all_records()[-10:]
         if not records:
             await callback.message.edit_text("📭 Нет заказов.")
         else:
