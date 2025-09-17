@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import asyncio
 from aiogram import F
 import os
@@ -8,12 +8,15 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import WebAppInfo  # <-- для WebApp
+from aiogram.types import WebAppInfo
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
 from datetime import datetime
 import logging
+import json
+from aiohttp import web
+import aiohttp_cors
 
 # Настройка логирования
 logging.basicConfig(
@@ -59,7 +62,7 @@ if not sheet.get_all_values():
         "№ заказа", "Адрес", "Тип работы", "Срок", "Комментарий",
         "Приоритет", "Статус", "Ответственный", "Дата создания",
         "Начал работу", "Выполнил работу", "Сумма", "Способ оплаты",
-        "Препарат", "Количество", "Площадь", "Фото чека"
+        "Препарат", "Количество", "Площадь", "Фото чека", "Координаты"
     ])
 
 # Открываем таблицу для учёта смен
@@ -107,7 +110,8 @@ async def set_bot_commands():
             types.BotCommand(command="admin", description="👑 Меню администратора"),
             types.BotCommand(command="get_receipt", description="🧾 Просмотр чека"),
             types.BotCommand(command="cancel", description="🚫 Отменить действие"),
-            types.BotCommand(command="start", description="🏠 Главное меню")
+            types.BotCommand(command="start", description="🏠 Главное меню"),
+            types.BotCommand(command="export", description="📊 Экспорт данных")
         ]
         worker_commands = [
             types.BotCommand(command="start", description="🏠 Главное меню"),
@@ -247,6 +251,31 @@ async def get_receipt(message: types.Message):
         logger.error(f"Ошибка при получении чека: {e}")
         await message.answer("❌ Ошибка сервера.")
 
+# Экспорт данных
+@dp.message(Command("export"))
+async def export_orders(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("🚫 Только администратор может экспортировать данные.")
+        return
+    try:
+        records = sheet.get_all_records()
+        import io
+        output = io.StringIO()
+        import csv
+        writer = csv.writer(output)
+        if records:
+            writer.writerow(records[0].keys())
+            for r in records:
+                writer.writerow(r.values())
+        output.seek(0)
+        await message.answer_document(
+            types.BufferedInputFile(output.getvalue().encode('utf-8'), filename="orders.csv"),
+            caption="📊 Экспорт всех заказов"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка экспорта: {e}")
+        await message.answer("❌ Ошибка экспорта.")
+
 # Меню
 async def show_worker_menu(message: types.Message):
     kb = InlineKeyboardBuilder()
@@ -262,13 +291,10 @@ async def show_admin_menu(message: types.Message):
     kb.button(text="🆕 Создать заказ", callback_data="admin_new_order")
     kb.button(text="📊 Отчёт по сменам", callback_data="admin_shift_report")
     kb.button(text="📋 Все заказы", callback_data="admin_all_orders")
-
-    # 🎨 КНОПКА WEBAPP — ОТКРЫВАЕТ ТВОЙ ИНТЕРФЕЙС
     kb.button(
         text="✨ Панель как в Figma",
         web_app=WebAppInfo(url="https://ab646487-hash.github.io/telegram-bot-webapp/")
     )
-
     kb.adjust(2)
     await message.answer("👑 Меню администратора:", reply_markup=kb.as_markup())
 
@@ -460,9 +486,23 @@ async def finalize_order(message: types.Message, state: FSMContext):
         row = [
             order_id, data['address'], data['work_type'], data['deadline'], data['comment'],
             data['priority'], "Назначен, не начат", TEAM_MEMBERS[data['assignee']],
-            datetime.now().strftime("%d.%m.%Y"), "", "", "", "", "", "", "", ""
+            datetime.now().strftime("%d.%m.%Y"), "", "", "", "", "", "", "", "", ""
         ]
         sheet.append_row(row)
+        
+        # Уведомляем исполнителя
+        assignee_id = data['assignee']
+        try:
+            await bot.send_message(
+                assignee_id,
+                f"🆕 Вам назначен новый заказ #{order_id}!\n📍 {data['address']}\n⚒ {data['work_type']}",
+                reply_markup=InlineKeyboardBuilder()
+                    .button(text="Открыть панель", web_app=WebAppInfo(url="https://ab646487-hash.github.io/telegram-bot-webapp/"))
+                    .as_markup()
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление: {e}")
+            
         text = (
             f"🆕 Заказ #{order_id} успешно назначен!\n"
             f"📍 Адрес: {data['address']}\n"
@@ -644,6 +684,83 @@ async def my_orders_list(callback: types.CallbackQuery):
         logger.error(f"Ошибка при просмотре заказов: {e}")
         await callback.answer("❌ Ошибка сервера.")
 
+# 🆕 API для WebApp — отдаёт список заказов в JSON
+async def get_orders(request):
+    try:
+        records = sheet.get_all_records()
+        orders = []
+        for r in records:
+            orders.append({
+                "id": r.get('№ заказа', ''),
+                "address": r.get('Адрес', ''),
+                "work_type": r.get('Тип работы', ''),
+                "deadline": r.get('Срок', ''),
+                "status": r.get('Статус', ''),
+                "assignee": r.get('Ответственный', ''),
+                "priority": r.get('Приоритет', 'Обычный'),
+                "coordinates": r.get('Координаты', '')
+            })
+        return web.json_response(orders)
+    except Exception as e:
+        logger.error(f"Ошибка при получении заказов: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+# 🆕 API для начала заказа
+async def start_order(request):
+    order_id = request.query.get('order_id')
+    if not order_id:
+        return web.json_response({"success": False, "error": "No order_id"})
+    try:
+        cell = sheet.find(str(order_id))
+        if not cell:
+            return web.json_response({"success": False, "error": "Order not found"})
+        sheet.update_cell(cell.row, 7, "В работе")
+        sheet.update_cell(cell.row, 10, datetime.now().strftime("%d.%m.%Y %H:%M"))
+        return web.json_response({"success": True})
+    except Exception as e:
+        logger.error(f"Ошибка при начале заказа: {e}")
+        return web.json_response({"success": False, "error": str(e)})
+
+# 🆕 API для завершения заказа
+async def complete_order(request):
+    order_id = request.query.get('order_id')
+    if not order_id:
+        return web.json_response({"success": False, "error": "No order_id"})
+    try:
+        cell = sheet.find(str(order_id))
+        if not cell:
+            return web.json_response({"success": False, "error": "Order not found"})
+        sheet.update_cell(cell.row, 7, "Выполнен")
+        sheet.update_cell(cell.row, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
+        return web.json_response({"success": True})
+    except Exception as e:
+        logger.error(f"Ошибка при завершении заказа: {e}")
+        return web.json_response({"success": False, "error": str(e)})
+
+# 🆕 API для обновления местоположения
+async def update_location(request):
+    try:
+        data = await request.json()
+        lat = data.get('lat')
+        lng = data.get('lng')
+        # Здесь можно сохранить координаты в таблицу
+        logger.info(f"Обновление местоположения: {lat}, {lng}")
+        return web.json_response({"success": True})
+    except Exception as e:
+        logger.error(f"Ошибка обновления местоположения: {e}")
+        return web.json_response({"success": False, "error": str(e)})
+
+# 🆕 API для SOS сигнала
+async def sos_alert(request):
+    try:
+        # Отправляем уведомление администраторам
+        for admin_id in ADMIN_IDS:
+            await bot.send_message(admin_id, "🚨 ЭКСТРЕННЫЙ СИГНАЛ! Сотруднику требуется помощь!")
+        return web.json_response({"success": True})
+    except Exception as e:
+        logger.error(f"Ошибка SOS сигнала: {e}")
+        return web.json_response({"success": False, "error": str(e)})
+
 # Глобальный обработчик ошибок
 @dp.errors()
 async def errors_handler(update, exception):
@@ -654,6 +771,41 @@ async def errors_handler(update, exception):
 async def main():
     logger.info("🚀 Бот запускается...")
     await set_bot_commands()
+    
+    # Создаем веб-сервер
+    app = web.Application()
+    
+    # Настраиваем CORS
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+        )
+    })
+    
+    # Добавляем маршруты
+    resource = cors.add(app.router.add_resource("/api/orders"))
+    cors.add(resource.add_route("GET", get_orders))
+    
+    resource = cors.add(app.router.add_resource("/api/start_order"))
+    cors.add(resource.add_route("POST", start_order))
+    
+    resource = cors.add(app.router.add_resource("/api/complete_order"))
+    cors.add(resource.add_route("POST", complete_order))
+    
+    resource = cors.add(app.router.add_resource("/api/update_location"))
+    cors.add(resource.add_route("POST", update_location))
+    
+    resource = cors.add(app.router.add_resource("/api/sos_alert"))
+    cors.add(resource.add_route("POST", sos_alert))
+    
+    # Запускаем веб-сервер и бота
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
